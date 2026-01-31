@@ -62,6 +62,17 @@ export const __testing = {
   },
 };
 
+type OpenAIResponsesInstructionsMode = "off" | "systemPrompt";
+
+type ResolvedOpenAIResponsesInstructions = {
+  mode: OpenAIResponsesInstructionsMode;
+  stripSystemPromptFromInput: boolean;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
 /**
  * Resolve provider-specific extra params from model config.
  * Used to pass through stream params like temperature/maxTokens.
@@ -194,21 +205,68 @@ export function resolveAgentTransportOverride(params: {
   return resolveSupportedTransport(params.effectiveExtraParams?.transport);
 }
 
+function resolveOpenAIResponsesInstructions(
+  extraParams: Record<string, unknown> | undefined,
+): ResolvedOpenAIResponsesInstructions | undefined {
+  if (!extraParams) {
+    return undefined;
+  }
+
+  let mode: OpenAIResponsesInstructionsMode | undefined;
+  let stripSystemPromptFromInput: boolean | undefined;
+
+  const directMode = extraParams.openaiResponsesInstructions;
+  if (directMode === "off" || directMode === "systemPrompt") {
+    mode = directMode;
+  }
+
+  const legacySend = extraParams.openaiResponsesSendInstructions;
+  if (legacySend === true) {
+    mode = "systemPrompt";
+  } else if (legacySend === false && mode === undefined) {
+    mode = "off";
+  }
+
+  const nested = extraParams.openaiResponses;
+  if (isRecord(nested)) {
+    const nestedMode = nested.instructions;
+    if (nestedMode === "off" || nestedMode === "systemPrompt") {
+      mode = nestedMode;
+    }
+    const nestedSend = nested.sendInstructions;
+    if (nestedSend === true) {
+      mode = "systemPrompt";
+    } else if (nestedSend === false && mode === undefined) {
+      mode = "off";
+    }
+    const nestedStrip = nested.stripSystemPromptFromInput;
+    if (typeof nestedStrip === "boolean") {
+      stripSystemPromptFromInput = nestedStrip;
+    }
+  }
+
+  if (!mode || mode === "off") {
+    return undefined;
+  }
+
+  return {
+    mode,
+    stripSystemPromptFromInput: stripSystemPromptFromInput ?? true,
+  };
+}
 function createStreamFnWithExtraParams(
   baseStreamFn: StreamFn | undefined,
   extraParams: Record<string, unknown> | undefined,
   provider: string,
   modelApi?: string,
 ): StreamFn | undefined {
-  if (!extraParams || Object.keys(extraParams).length === 0) {
-    return undefined;
-  }
+  const openaiResponsesInstructions = resolveOpenAIResponsesInstructions(extraParams);
 
   const streamParams: CacheRetentionStreamOptions = {};
-  if (typeof extraParams.temperature === "number") {
+  if (typeof extraParams?.temperature === "number") {
     streamParams.temperature = extraParams.temperature;
   }
-  if (typeof extraParams.maxTokens === "number") {
+  if (typeof extraParams?.maxTokens === "number") {
     streamParams.maxTokens = extraParams.maxTokens;
   }
   const transport = resolveSupportedTransport(extraParams.transport);
@@ -229,18 +287,106 @@ function createStreamFnWithExtraParams(
     streamParams.cacheRetention = cacheRetention;
   }
 
-  if (Object.keys(streamParams).length === 0) {
+  // Extract OpenRouter provider routing preferences from extraParams.provider.
+  // Injected into model.compat.openRouterRouting so pi-ai's buildParams sets
+  // params.provider in the API request body (openai-completions.js L359-362).
+  // pi-ai's OpenRouterRouting type only declares { only?, order? }, but at
+  // runtime the full object is forwarded — enabling allow_fallbacks,
+  // data_collection, ignore, sort, quantizations, etc.
+  const providerRouting =
+    provider === "openrouter" &&
+    extraParams.provider != null &&
+    typeof extraParams.provider === "object"
+      ? (extraParams.provider as Record<string, unknown>)
+      : undefined;
+
+  if (
+    Object.keys(streamParams).length === 0 &&
+    !providerRouting &&
+    !openaiResponsesInstructions
+  ) {
     return undefined;
   }
 
-  log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`);
+  if (Object.keys(streamParams).length > 0) {
+    log.debug(`creating streamFn wrapper with params: ${JSON.stringify(streamParams)}`);
+  }
+  if (providerRouting) {
+    log.debug(`OpenRouter provider routing: ${JSON.stringify(providerRouting)}`);
+  }
 
   const underlying = baseStreamFn ?? streamSimple;
   const wrappedStreamFn: StreamFn = (model, context, options) => {
-    return underlying(model, context, {
-      ...streamParams,
-      ...options,
-    });
+    // When provider routing is configured, inject it into model.compat so
+    // pi-ai picks it up via model.compat.openRouterRouting.
+    const effectiveModel = providerRouting
+      ? ({
+          ...model,
+          compat: { ...model.compat, openRouterRouting: providerRouting },
+        } as unknown as typeof model)
+      : model;
+    return underlying(
+      effectiveModel,
+      context,
+      (() => {
+        const maybeApi = (model as { api?: unknown } | null)?.api;
+        const isOpenAIResponsesApi =
+          maybeApi === "openai-responses" || maybeApi === "openai-codex-responses";
+        if (!isOpenAIResponsesApi || !openaiResponsesInstructions) {
+          return { ...streamParams, ...options };
+        }
+
+        const originalOnPayload = (
+          options as { onPayload?: ((payload: unknown) => void) | undefined } | undefined
+        )?.onPayload;
+        const systemPrompt =
+          typeof (context as { systemPrompt?: unknown } | null)?.systemPrompt === "string"
+            ? ((context as { systemPrompt?: string }).systemPrompt ?? "").trim()
+            : "";
+
+        const onPayload = (payload: unknown) => {
+          originalOnPayload?.(payload);
+          if (!systemPrompt) {
+            return;
+          }
+          if (!payload || typeof payload !== "object") {
+            return;
+          }
+          const params = payload as Record<string, unknown>;
+          const hasInstructions =
+            typeof params.instructions === "string" && params.instructions.trim().length > 0;
+          if (hasInstructions) {
+            return;
+          }
+
+          params.instructions = systemPrompt;
+
+          if (!openaiResponsesInstructions.stripSystemPromptFromInput) {
+            return;
+          }
+          const input = params.input;
+          if (!Array.isArray(input) || input.length === 0) {
+            return;
+          }
+          const first = input[0] as Record<string, unknown> | undefined;
+          const role = first?.role;
+          const content = first?.content;
+          if (
+            (role === "system" || role === "developer") &&
+            typeof content === "string" &&
+            content.trim() === systemPrompt
+          ) {
+            params.input = input.slice(1);
+          }
+        };
+
+        return {
+          ...streamParams,
+          ...options,
+          onPayload,
+        };
+      })(),
+    );
   };
 
   return wrappedStreamFn;
