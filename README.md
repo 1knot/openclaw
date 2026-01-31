@@ -88,6 +88,33 @@ Model note: while many providers/models are supported, for the best experience a
 - Models config + CLI: [Models](https://docs.openclaw.ai/concepts/models)
 - Auth profile rotation (OAuth vs API keys) + fallbacks: [Model failover](https://docs.openclaw.ai/concepts/model-failover)
 
+### OpenAI Responses: using `systemPrompt` as `instructions`
+
+If you use the OpenAI **Responses API** (model `api: openai-responses` or `api: openai-codex-responses`), you can tell OpenClaw to pass the agent `systemPrompt` via the request `instructions` field.
+
+Add this to your model config:
+
+```yaml
+agents:
+  defaults:
+    models:
+      "codex-proxy/gpt-5.2":
+        params:
+          # Inject context.systemPrompt into the OpenAI Responses payload as `instructions`.
+          # If payload.instructions already exists, it will NOT be overridden.
+          openaiResponsesInstructions: systemPrompt
+
+          # Optional: remove the first input item when it exactly matches the system prompt
+          # (avoids sending the same instruction twice).
+          openaiResponses:
+            stripSystemPromptFromInput: true
+```
+
+Notes:
+
+- If `openaiResponsesInstructions` is not set (or is `off`), no behavior changes.
+- Legacy key `openaiResponsesSendInstructions: true` is supported (treated as `systemPrompt`).
+
 ## Install (recommended)
 
 Runtime: **Node 24 (recommended) or Node 22.16+**.
