@@ -269,17 +269,17 @@ function createStreamFnWithExtraParams(
   if (typeof extraParams?.maxTokens === "number") {
     streamParams.maxTokens = extraParams.maxTokens;
   }
-  const transport = resolveSupportedTransport(extraParams.transport);
+  const transport = resolveSupportedTransport(extraParams?.transport);
   if (transport) {
     streamParams.transport = transport;
-  } else if (extraParams.transport != null) {
+  } else if (extraParams?.transport != null) {
     const transportSummary =
       typeof extraParams.transport === "string"
         ? extraParams.transport
         : typeof extraParams.transport;
     log.warn(`ignoring invalid transport param: ${transportSummary}`);
   }
-  if (typeof extraParams.openaiWsWarmup === "boolean") {
+  if (typeof extraParams?.openaiWsWarmup === "boolean") {
     streamParams.openaiWsWarmup = extraParams.openaiWsWarmup;
   }
   const cacheRetention = resolveCacheRetention(extraParams, provider, modelApi);
